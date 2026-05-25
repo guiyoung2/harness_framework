@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python - <<'PY'\nimport json, re, sys\npayload = json.load(sys.stdin)\ncommand = payload.get('tool_input', {}).get('command', '')\nblocked = [r'\\brm\\s+-rf\\b', r'\\bgit\\s+reset\\s+--hard\\b', r'\\bgit\\s+push\\s+--force\\b', r'\\bDROP\\s+TABLE\\b']\nif any(re.search(pattern, command, re.I) for pattern in blocked):\n    print('Blocked by harness safety hook: dangerous command requires explicit human approval.', file=sys.stderr)\n    sys.exit(2)\nPY"
+          }
+        ]
+      }
+    ]
+  }
+}
+

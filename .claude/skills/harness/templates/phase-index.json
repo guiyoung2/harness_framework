@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "name": "1-feature-name",
+  "status": "pending",
+  "created_at": "YYYY-MM-DDTHH:MM:SSZ",
+  "steps": [
+    {
+      "id": 0,
+      "title": "Inspect current structure",
+      "file": "step0.md",
+      "status": "pending"
+    }
+  ]
+}
+
