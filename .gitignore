@@ -1,7 +1,10 @@
-__pycache__/
-*.pyc
-.pytest_cache/
-.mypy_cache/
-.DS_Store
-phases/*/*-output.json
+node_modules/
+.next/
+out/
+next-env.d.ts
+tsconfig.tsbuildinfo
 
+# phase execution outputs
+phases/**/phase*-output.json
+phases/**/step*-output.json
+scripts/__pycache__/

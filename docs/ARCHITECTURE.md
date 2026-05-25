@@ -1,12 +1,24 @@
-# Architecture
+# 아키텍처
 
-Use this file for the current system shape:
+## 디렉토리 구조
+```
+src/
+├── app/               # 페이지 + API 라우트
+├── components/        # UI 컴포넌트
+├── types/             # TypeScript 타입 정의
+├── lib/               # 유틸리티 + 헬퍼
+└── services/          # 외부 API 래퍼
+```
 
-- runtime and framework
-- folder responsibilities
-- data flow
-- API boundaries
-- state management
-- test and build commands
+## 패턴
+{사용하는 디자인 패턴 (예: Server Components 기본, 인터랙션이 필요한 곳만 Client Component)}
 
-Update this file when a phase changes the system structure in a lasting way.
+## 데이터 흐름
+```
+{데이터가 어떻게 흐르는지 (예:
+사용자 입력 → Client Component → API Route → 외부 API → 응답 → UI 업데이트
+)}
+```
+
+## 상태 관리
+{상태 관리 방식 (예: 서버 상태는 Server Components, 클라이언트 상태는 useState/useReducer)}

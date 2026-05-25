@@ -1,255 +1,417 @@
 #!/usr/bin/env python3
-"""Execute harness phase steps with minimal, explicit context."""
+"""
+Harness Step Executor — phase 내 step을 순차 실행하고 자가 교정한다.
 
-from __future__ import annotations
+Usage:
+    python3 scripts/execute.py <phase-dir> [--push]
+"""
 
 import argparse
+import contextlib
 import json
+import os
 import subprocess
 import sys
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import threading
+import time
+import types
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Optional
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
-ROOT = Path.cwd()
+@contextlib.contextmanager
+def progress_indicator(label: str):
+    """터미널 진행 표시기. with 문으로 사용하며 .elapsed 로 경과 시간을 읽는다."""
+    frames = "◐◓◑◒"
+    stop = threading.Event()
+    t0 = time.monotonic()
+
+    def _animate():
+        idx = 0
+        while not stop.wait(0.12):
+            sec = int(time.monotonic() - t0)
+            sys.stderr.write(f"\r{frames[idx % len(frames)]} {label} [{sec}s]")
+            sys.stderr.flush()
+            idx += 1
+        sys.stderr.write("\r" + " " * (len(label) + 20) + "\r")
+        sys.stderr.flush()
+
+    th = threading.Thread(target=_animate, daemon=True)
+    th.start()
+    info = types.SimpleNamespace(elapsed=0.0)
+    try:
+        yield info
+    finally:
+        stop.set()
+        th.join()
+        info.elapsed = time.monotonic() - t0
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as file:
-        return json.load(file)
-
-
-def save_json(path: Path, data: dict[str, Any]) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def read_optional(path: Path) -> str:
-    if not path.exists():
-        return ""
-    return path.read_text(encoding="utf-8")
-
-
-def truncate(text: str, limit: int = 1200) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
-
-
-def extract_json_object(text: str) -> dict[str, Any] | None:
-    """Extract the first valid JSON object from plain text or a fenced block."""
-    decoder = json.JSONDecoder()
-    stripped = text.strip()
-
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
-
-    for index, char in enumerate(stripped):
-        if char != "{":
-            continue
-        try:
-            parsed, _ = decoder.raw_decode(stripped[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
-
-
-def normalize_step_result(raw_text: str, returncode: int) -> dict[str, Any]:
-    parsed = extract_json_object(raw_text)
-    if parsed:
-        parsed.setdefault("status", "completed" if returncode == 0 else "error")
-        parsed.setdefault("summary", truncate(raw_text, 400))
-        parsed.setdefault("changed_files", [])
-        parsed.setdefault("decisions", [])
-        parsed.setdefault("verification", [])
-        parsed.setdefault("blockers", [])
-        return parsed
-
-    return {
-        "status": "completed" if returncode == 0 else "error",
-        "summary": truncate(raw_text.strip() or "No output.", 400),
-        "changed_files": [],
-        "decisions": [],
-        "verification": [],
-        "blockers": [],
-    }
-
-
-@dataclass
 class StepExecutor:
-    phase_name: str
-    unsafe_auto: bool = False
-    use_branch: bool = False
-    commit: bool = False
-    push: bool = False
+    """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
-    @property
-    def phase_dir(self) -> Path:
-        return ROOT / "phases" / self.phase_name
+    MAX_RETRIES = 3
+    FEAT_MSG = "feat({phase}): step {num} — {name}"
+    CHORE_MSG = "chore({phase}): step {num} output"
+    TZ = timezone(timedelta(hours=9))
 
-    @property
-    def index_path(self) -> Path:
-        return self.phase_dir / "index.json"
+    def __init__(self, phase_dir_name: str, *, auto_push: bool = False):
+        self._root = str(ROOT)
+        self._phases_dir = ROOT / "phases"
+        self._phase_dir = self._phases_dir / phase_dir_name
+        self._phase_dir_name = phase_dir_name
+        self._top_index_file = self._phases_dir / "index.json"
+        self._auto_push = auto_push
 
-    def run(self) -> int:
-        if not self.index_path.exists():
-            print(f"Missing phase index: {self.index_path}", file=sys.stderr)
-            return 1
+        if not self._phase_dir.is_dir():
+            print(f"ERROR: {self._phase_dir} not found")
+            sys.exit(1)
 
-        if self.use_branch:
-            self.checkout_branch()
+        self._index_file = self._phase_dir / "index.json"
+        if not self._index_file.exists():
+            print(f"ERROR: {self._index_file} not found")
+            sys.exit(1)
 
-        index = load_json(self.index_path)
-        for step in index.get("steps", []):
-            if step.get("status") == "completed":
-                continue
-            if step.get("status") == "blocked":
-                print(f"Blocked step remains unresolved: {step.get('file')}", file=sys.stderr)
-                return 2
-            result = self.run_step(index, step)
-            step.update(
-                {
-                    "status": result["status"],
-                    "summary": result["summary"],
-                    "changed_files": result["changed_files"],
-                    "decisions": result["decisions"],
-                    "verification": result["verification"],
-                    "blockers": result["blockers"],
-                    "updated_at": now_iso(),
-                    "output_file": f"{Path(step['file']).stem}-output.json",
-                }
-            )
-            save_json(self.index_path, index)
+        idx = self._read_json(self._index_file)
+        self._project = idx.get("project", "project")
+        self._phase_name = idx.get("phase", phase_dir_name)
+        self._total = len(idx["steps"])
 
-            if result["status"] != "completed":
-                return 2 if result["status"] == "blocked" else 1
+    def run(self):
+        self._print_header()
+        self._check_blockers()
+        self._checkout_branch()
+        guardrails = self._load_guardrails()
+        self._ensure_created_at()
+        self._execute_all_steps(guardrails)
+        self._finalize()
 
-            if self.commit:
-                self.commit_step(step)
+    # --- timestamps ---
 
-        index["status"] = "completed"
-        index["completed_at"] = now_iso()
-        save_json(self.index_path, index)
+    def _stamp(self) -> str:
+        return datetime.now(self.TZ).strftime("%Y-%m-%dT%H:%M:%S%z")
 
-        if self.commit:
-            self.commit_metadata()
-        if self.push:
-            self.push_branch()
-        return 0
+    # --- JSON I/O ---
 
-    def run_step(self, index: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
-        step_path = self.phase_dir / step["file"]
-        output_path = self.phase_dir / f"{step_path.stem}-output.json"
-        prompt = self.build_prompt(index, step, step_path)
-        command = ["claude", "-p", prompt, "--output-format", "json"]
-        if self.unsafe_auto:
-            command.append("--dangerously-skip-permissions")
+    @staticmethod
+    def _read_json(p: Path) -> dict:
+        return json.loads(p.read_text(encoding="utf-8"))
 
-        completed = subprocess.run(command, text=True, capture_output=True, encoding="utf-8")
-        raw = completed.stdout.strip() or completed.stderr.strip()
+    @staticmethod
+    def _write_json(p: Path, data: dict):
+        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        claude_payload = extract_json_object(raw)
-        agent_text = raw
-        if claude_payload and isinstance(claude_payload.get("result"), str):
-            agent_text = claude_payload["result"]
+    # --- git ---
 
-        result = normalize_step_result(agent_text, completed.returncode)
-        payload = {
-            "phase": self.phase_name,
-            "step": step.get("id"),
-            "step_file": step["file"],
-            "returncode": completed.returncode,
-            "captured_at": now_iso(),
-            "result": result,
-            "raw_output": raw,
-        }
-        save_json(output_path, payload)
-        return result
+    def _run_git(self, *args) -> subprocess.CompletedProcess:
+        cmd = ["git"] + list(args)
+        return subprocess.run(cmd, cwd=self._root, capture_output=True, text=True)
 
-    def build_prompt(self, index: dict[str, Any], step: dict[str, Any], step_path: Path) -> str:
-        root_rules = read_optional(ROOT / "CLAUDE.md")
-        previous = [
-            {
-                "id": item.get("id"),
-                "summary": item.get("summary"),
-                "changed_files": item.get("changed_files", []),
-                "decisions": item.get("decisions", []),
-            }
-            for item in index.get("steps", [])
-            if item.get("status") == "completed"
+    def _checkout_branch(self):
+        branch = f"feat-{self._phase_name}"
+
+        r = self._run_git("rev-parse", "--abbrev-ref", "HEAD")
+        if r.returncode != 0:
+            print(f"  ERROR: git을 사용할 수 없거나 git repo가 아닙니다.")
+            print(f"  {r.stderr.strip()}")
+            sys.exit(1)
+
+        if r.stdout.strip() == branch:
+            return
+
+        r = self._run_git("rev-parse", "--verify", branch)
+        r = self._run_git("checkout", branch) if r.returncode == 0 else self._run_git("checkout", "-b", branch)
+
+        if r.returncode != 0:
+            print(f"  ERROR: 브랜치 '{branch}' checkout 실패.")
+            print(f"  {r.stderr.strip()}")
+            print(f"  Hint: 변경사항을 stash하거나 commit한 후 다시 시도하세요.")
+            sys.exit(1)
+
+        print(f"  Branch: {branch}")
+
+    def _commit_step(self, step_num: int, step_name: str):
+        output_rel = f"phases/{self._phase_dir_name}/step{step_num}-output.json"
+        index_rel = f"phases/{self._phase_dir_name}/index.json"
+
+        self._run_git("add", "-A")
+        self._run_git("reset", "HEAD", "--", output_rel)
+        self._run_git("reset", "HEAD", "--", index_rel)
+
+        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+            msg = self.FEAT_MSG.format(phase=self._phase_name, num=step_num, name=step_name)
+            r = self._run_git("commit", "-m", msg)
+            if r.returncode == 0:
+                print(f"  Commit: {msg}")
+            else:
+                print(f"  WARN: 코드 커밋 실패: {r.stderr.strip()}")
+
+        self._run_git("add", "-A")
+        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+            msg = self.CHORE_MSG.format(phase=self._phase_name, num=step_num)
+            r = self._run_git("commit", "-m", msg)
+            if r.returncode != 0:
+                print(f"  WARN: housekeeping 커밋 실패: {r.stderr.strip()}")
+
+    # --- top-level index ---
+
+    def _update_top_index(self, status: str):
+        if not self._top_index_file.exists():
+            return
+        top = self._read_json(self._top_index_file)
+        ts = self._stamp()
+        for phase in top.get("phases", []):
+            if phase.get("dir") == self._phase_dir_name:
+                phase["status"] = status
+                ts_key = {"completed": "completed_at", "error": "failed_at", "blocked": "blocked_at"}.get(status)
+                if ts_key:
+                    phase[ts_key] = ts
+                break
+        self._write_json(self._top_index_file, top)
+
+    # --- guardrails & context ---
+
+    def _load_guardrails(self) -> str:
+        sections = []
+        claude_md = ROOT / "CLAUDE.md"
+        if claude_md.exists():
+            sections.append(f"## 프로젝트 규칙 (CLAUDE.md)\n\n{claude_md.read_text()}")
+        docs_dir = ROOT / "docs"
+        if docs_dir.is_dir():
+            for doc in sorted(docs_dir.glob("*.md")):
+                sections.append(f"## {doc.stem}\n\n{doc.read_text()}")
+        return "\n\n---\n\n".join(sections) if sections else ""
+
+    @staticmethod
+    def _build_step_context(index: dict) -> str:
+        lines = [
+            f"- Step {s['step']} ({s['name']}): {s['summary']}"
+            for s in index["steps"]
+            if s["status"] == "completed" and s.get("summary")
         ]
-        return "\n\n".join(
-            [
-                "# Harness Step Execution",
-                "Follow the project rules and execute only the current step.",
-                "Read files listed in the step before editing. Do not load every docs file unless the step asks for it.",
-                "End with the JSON output contract requested by the step.",
-                "## Project Rules",
-                root_rules or "(No CLAUDE.md found.)",
-                "## Phase Index",
-                json.dumps(index, ensure_ascii=False, indent=2),
-                "## Previous Completed Steps",
-                json.dumps(previous, ensure_ascii=False, indent=2),
-                "## Current Step",
-                step_path.read_text(encoding="utf-8"),
-            ]
+        if not lines:
+            return ""
+        return "## 이전 Step 산출물\n\n" + "\n".join(lines) + "\n\n"
+
+    def _build_preamble(self, guardrails: str, step_context: str,
+                        prev_error: Optional[str] = None) -> str:
+        commit_example = self.FEAT_MSG.format(
+            phase=self._phase_name, num="N", name="<step-name>"
+        )
+        retry_section = ""
+        if prev_error:
+            retry_section = (
+                f"\n## ⚠ 이전 시도 실패 — 아래 에러를 반드시 참고하여 수정하라\n\n"
+                f"{prev_error}\n\n---\n\n"
+            )
+        return (
+            f"당신은 {self._project} 프로젝트의 개발자입니다. 아래 step을 수행하세요.\n\n"
+            f"{guardrails}\n\n---\n\n"
+            f"{step_context}{retry_section}"
+            f"## 작업 규칙\n\n"
+            f"1. 이전 step에서 작성된 코드를 확인하고 일관성을 유지하라.\n"
+            f"2. 이 step에 명시된 작업만 수행하라. 추가 기능이나 파일을 만들지 마라.\n"
+            f"3. 기존 테스트를 깨뜨리지 마라.\n"
+            f"4. AC(Acceptance Criteria) 검증을 직접 실행하라.\n"
+            f"5. /phases/{self._phase_dir_name}/index.json의 해당 step status를 업데이트하라:\n"
+            f"   - AC 통과 → \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄로 요약\n"
+            f"   - {self.MAX_RETRIES}회 수정 시도 후에도 실패 → \"error\" + \"error_message\" 기록\n"
+            f"   - 사용자 개입이 필요한 경우 (API 키, 인증, 수동 설정 등) → \"blocked\" + \"blocked_reason\" 기록 후 즉시 중단\n"
+            f"6. 모든 변경사항을 커밋하라:\n"
+            f"   {commit_example}\n\n---\n\n"
         )
 
-    def checkout_branch(self) -> None:
-        branch = f"harness/{self.phase_name}"
-        result = subprocess.run(["git", "checkout", "-B", branch], text=True)
+    # --- Claude 호출 ---
+
+    def _invoke_claude(self, step: dict, preamble: str) -> dict:
+        step_num, step_name = step["step"], step["name"]
+        step_file = self._phase_dir / f"step{step_num}.md"
+
+        if not step_file.exists():
+            print(f"  ERROR: {step_file} not found")
+            sys.exit(1)
+
+        prompt = preamble + step_file.read_text()
+        result = subprocess.run(
+            ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
+            cwd=self._root, capture_output=True, text=True, timeout=1800,
+        )
+
         if result.returncode != 0:
-            raise SystemExit(result.returncode)
+            print(f"\n  WARN: Claude가 비정상 종료됨 (code {result.returncode})")
+            if result.stderr:
+                print(f"  stderr: {result.stderr[:500]}")
 
-    def commit_step(self, step: dict[str, Any]) -> None:
-        subprocess.run(["git", "add", "-A"], check=True)
-        title = step.get("title") or step.get("file")
-        subprocess.run(["git", "commit", "-m", f"feat({self.phase_name}): {title}"], check=False)
+        output = {
+            "step": step_num, "name": step_name,
+            "exitCode": result.returncode,
+            "stdout": result.stdout, "stderr": result.stderr,
+        }
+        out_path = self._phase_dir / f"step{step_num}-output.json"
+        with open(out_path, "w") as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
 
-    def commit_metadata(self) -> None:
-        subprocess.run(["git", "add", str(self.phase_dir)], check=True)
-        subprocess.run(["git", "commit", "-m", f"chore({self.phase_name}): complete phase metadata"], check=False)
+        return output
 
-    def push_branch(self) -> None:
-        current = subprocess.run(["git", "branch", "--show-current"], text=True, capture_output=True, check=True)
-        branch = current.stdout.strip()
-        subprocess.run(["git", "push", "-u", "origin", branch], check=True)
+    # --- 헤더 & 검증 ---
+
+    def _print_header(self):
+        print(f"\n{'='*60}")
+        print(f"  Harness Step Executor")
+        print(f"  Phase: {self._phase_name} | Steps: {self._total}")
+        if self._auto_push:
+            print(f"  Auto-push: enabled")
+        print(f"{'='*60}")
+
+    def _check_blockers(self):
+        index = self._read_json(self._index_file)
+        for s in reversed(index["steps"]):
+            if s["status"] == "error":
+                print(f"\n  ✗ Step {s['step']} ({s['name']}) failed.")
+                print(f"  Error: {s.get('error_message', 'unknown')}")
+                print(f"  Fix and reset status to 'pending' to retry.")
+                sys.exit(1)
+            if s["status"] == "blocked":
+                print(f"\n  ⏸ Step {s['step']} ({s['name']}) blocked.")
+                print(f"  Reason: {s.get('blocked_reason', 'unknown')}")
+                print(f"  Resolve and reset status to 'pending' to retry.")
+                sys.exit(2)
+            if s["status"] != "pending":
+                break
+
+    def _ensure_created_at(self):
+        index = self._read_json(self._index_file)
+        if "created_at" not in index:
+            index["created_at"] = self._stamp()
+            self._write_json(self._index_file, index)
+
+    # --- 실행 루프 ---
+
+    def _execute_single_step(self, step: dict, guardrails: str) -> bool:
+        """단일 step 실행 (재시도 포함). 완료되면 True, 실패/차단이면 False."""
+        step_num, step_name = step["step"], step["name"]
+        done = sum(1 for s in self._read_json(self._index_file)["steps"] if s["status"] == "completed")
+        prev_error = None
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            index = self._read_json(self._index_file)
+            step_context = self._build_step_context(index)
+            preamble = self._build_preamble(guardrails, step_context, prev_error)
+
+            tag = f"Step {step_num}/{self._total - 1} ({done} done): {step_name}"
+            if attempt > 1:
+                tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
+
+            with progress_indicator(tag) as pi:
+                self._invoke_claude(step, preamble)
+                elapsed = int(pi.elapsed)
+
+            index = self._read_json(self._index_file)
+            status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
+            ts = self._stamp()
+
+            if status == "completed":
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["completed_at"] = ts
+                self._write_json(self._index_file, index)
+                self._commit_step(step_num, step_name)
+                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
+                return True
+
+            if status == "blocked":
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["blocked_at"] = ts
+                self._write_json(self._index_file, index)
+                reason = next((s.get("blocked_reason", "") for s in index["steps"] if s["step"] == step_num), "")
+                print(f"  ⏸ Step {step_num}: {step_name} blocked [{elapsed}s]")
+                print(f"    Reason: {reason}")
+                self._update_top_index("blocked")
+                sys.exit(2)
+
+            err_msg = next(
+                (s.get("error_message", "Step did not update status") for s in index["steps"] if s["step"] == step_num),
+                "Step did not update status",
+            )
+
+            if attempt < self.MAX_RETRIES:
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["status"] = "pending"
+                        s.pop("error_message", None)
+                self._write_json(self._index_file, index)
+                prev_error = err_msg
+                print(f"  ↻ Step {step_num}: retry {attempt}/{self.MAX_RETRIES} — {err_msg}")
+            else:
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["status"] = "error"
+                        s["error_message"] = f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
+                        s["failed_at"] = ts
+                self._write_json(self._index_file, index)
+                self._commit_step(step_num, step_name)
+                print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_RETRIES} attempts [{elapsed}s]")
+                print(f"    Error: {err_msg}")
+                self._update_top_index("error")
+                sys.exit(1)
+
+        return False  # unreachable
+
+    def _execute_all_steps(self, guardrails: str):
+        while True:
+            index = self._read_json(self._index_file)
+            pending = next((s for s in index["steps"] if s["status"] == "pending"), None)
+            if pending is None:
+                print("\n  All steps completed!")
+                return
+
+            step_num = pending["step"]
+            for s in index["steps"]:
+                if s["step"] == step_num and "started_at" not in s:
+                    s["started_at"] = self._stamp()
+                    self._write_json(self._index_file, index)
+                    break
+
+            self._execute_single_step(pending, guardrails)
+
+    def _finalize(self):
+        index = self._read_json(self._index_file)
+        index["completed_at"] = self._stamp()
+        self._write_json(self._index_file, index)
+        self._update_top_index("completed")
+
+        self._run_git("add", "-A")
+        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+            msg = f"chore({self._phase_name}): mark phase completed"
+            r = self._run_git("commit", "-m", msg)
+            if r.returncode == 0:
+                print(f"  ✓ {msg}")
+
+        if self._auto_push:
+            branch = f"feat-{self._phase_name}"
+            r = self._run_git("push", "-u", "origin", branch)
+            if r.returncode != 0:
+                print(f"\n  ERROR: git push 실패: {r.stderr.strip()}")
+                sys.exit(1)
+            print(f"  ✓ Pushed to origin/{branch}")
+
+        print(f"\n{'='*60}")
+        print(f"  Phase '{self._phase_name}' completed!")
+        print(f"{'='*60}")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Execute a harness phase.")
-    parser.add_argument("phase", help="Phase directory name under phases/.")
-    parser.add_argument("--unsafe-auto", action="store_true", help="Pass --dangerously-skip-permissions to Claude.")
-    parser.add_argument("--branch", action="store_true", help="Create/reset a harness/<phase> branch before execution.")
-    parser.add_argument("--commit", action="store_true", help="Commit after each completed step.")
-    parser.add_argument("--push", action="store_true", help="Push the current branch after completion. Implies --commit.")
-    return parser.parse_args()
+def main():
+    parser = argparse.ArgumentParser(description="Harness Step Executor")
+    parser.add_argument("phase_dir", help="Phase directory name (e.g. 0-mvp)")
+    parser.add_argument("--push", action="store_true", help="Push branch after completion")
+    args = parser.parse_args()
 
-
-def main() -> int:
-    args = parse_args()
-    executor = StepExecutor(
-        phase_name=args.phase,
-        unsafe_auto=args.unsafe_auto,
-        use_branch=args.branch,
-        commit=args.commit or args.push,
-        push=args.push,
-    )
-    return executor.run()
+    StepExecutor(args.phase_dir, auto_push=args.push).run()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
-
+    main()
