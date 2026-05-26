@@ -1,0 +1,14 @@
+{
+  "task": "{task-name}",
+  "created_at": "{ISO-8601}",
+  "features": [
+    {
+      "id": "feat-1",
+      "name": "기능 이름",
+      "description": "이 기능이 완료된 기준을 구체적으로 설명",
+      "passes": false,
+      "verified_at": null,
+      "verified_by_step": null
+    }
+  ]
+}

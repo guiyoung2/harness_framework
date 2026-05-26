@@ -37,6 +37,56 @@ description: 기능 단위·리스크가 큰 소프트웨어 작업을 phase/ste
 
 사용자가 승인하면 아래 파일들을 생성한다.
 
+#### D-0. 인수인계 & 완료 게이트 파일 (신규)
+
+**`phases/{task-name}/feature_list.json`** — 조기 종료 방지 게이트
+
+```json
+{
+  "task": "{task-name}",
+  "created_at": "{ISO-8601}",
+  "features": [
+    {
+      "id": "feat-1",
+      "name": "기능 이름",
+      "description": "완료 기준 설명",
+      "passes": false,
+      "verified_at": null,
+      "verified_by_step": null
+    }
+  ]
+}
+```
+
+- 이 task에서 구현할 **모든 기능**을 나열한다. 누락되면 조기 종료 게이트가 무의미해진다.
+- 모든 feature는 `passes: false`로 초기화. execute.py가 전체 완료 시 미통과 feature를 검사한다.
+- 각 step 완료 시 Claude/Codex가 해당 step에서 달성된 feature를 `passes: true`로 갱신한다.
+
+**`phases/{task-name}/progress.md`** — 세션 간 인수인계 문서
+
+```markdown
+# {task-name} 진행 현황
+
+## 마지막 업데이트
+{ISO-8601} — Step 0/{total} 완료
+
+## 완료된 작업
+- 없음
+
+## 현재 진행 중
+- Step 0: {first-step-name}
+
+## 다음 할 일
+(첫 번째 step 시작 전 작성 불필요)
+
+## 주의사항
+(첫 번째 step 시작 전 작성 불필요)
+```
+
+- 뼈대(타임스탬프, 완료/진행 목록)는 execute.py가 step 완료마다 자동 갱신한다.
+- '다음 할 일'과 '주의사항'은 각 step 완료 시 Claude/Codex가 작성한다.
+- 새 세션에서 `python3 scripts/execute.py {task-name}` 실행 시 이 파일이 자동으로 출력된다.
+
 #### D-1. `phases/index.json` (전체 현황)
 
 여러 task를 관리하는 top-level 인덱스. 이미 존재하면 `phases` 배열에 새 항목을 추가한다.
@@ -139,6 +189,13 @@ npm test        # 테스트 통과
 ```
 
 ### E. 실행
+
+execute.py 실행 전, 사용자에게 다음을 확인한다:
+
+```
+□ feature_list.json의 feature 목록이 이 task의 완료 기준을 모두 포함하는가?
+  누락된 기능이 있으면 지금 추가하라. 나중에 추가하면 완료 게이트를 우회하게 된다.
+```
 
 ```bash
 python3 scripts/execute.py {task-name}        # 순차 실행

@@ -126,6 +126,7 @@ class StepExecutor:
 
     def run(self):
         self._print_header()
+        self._print_progress_on_start()
         self._check_blockers()
         self._checkout_branch()
         guardrails = self._load_guardrails()
@@ -265,7 +266,14 @@ class StepExecutor:
             f"   - {self.MAX_RETRIES}회 수정 시도 후에도 실패 → \"error\" + \"error_message\" 기록\n"
             f"   - 사용자 개입이 필요한 경우 (API 키, 인증, 수동 설정 등) → \"blocked\" + \"blocked_reason\" 기록 후 즉시 중단\n"
             f"6. 모든 변경사항을 커밋하라:\n"
-            f"   {commit_example}\n\n---\n\n"
+            f"   {commit_example}\n"
+            f"7. 이 step 완료 후 반드시 다음 두 파일을 업데이트하라:\n"
+            f"   a. phases/{self._phase_dir_name}/progress.md — '다음 할 일'과 '주의사항' 섹션을 현재 상태 기준으로 갱신\n"
+            f"      ('다음 할 일': 다음 step에서 해야 할 것, 필요한 준비사항)\n"
+            f"      ('주의사항': 이 step에서 발견한 트랩, 외부 의존성, 중요 설정값 등)\n"
+            f"   b. phases/{self._phase_dir_name}/feature_list.json — 이 step에서 완료된 feature를 업데이트:\n"
+            f"      passes: true, verified_at: ISO-8601 현재 시각, verified_by_step: <현재 step 번호>\n"
+            f"   (두 파일이 없으면 스킵)\n\n---\n\n"
         )
 
     # --- 엔진 호출 ---
@@ -360,6 +368,7 @@ class StepExecutor:
                     if s["step"] == step_num:
                         s["completed_at"] = ts
                 self._write_json(self._index_file, index)
+                self._update_progress_skeleton()
                 self._commit_step(step_num, step_name)
                 print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
                 return True
@@ -420,7 +429,80 @@ class StepExecutor:
 
             self._execute_single_step(pending, guardrails)
 
+    # --- 진행 현황 & 완료 게이트 ---
+
+    def _print_progress_on_start(self):
+        """이전 진행 현황을 출력해 새 세션에서 빠르게 컨텍스트를 파악한다."""
+        progress_path = self._phase_dir / "progress.md"
+        if progress_path.exists():
+            print(f"\n{'='*60}")
+            print("  이전 진행 현황")
+            print(f"{'='*60}")
+            print(progress_path.read_text(encoding="utf-8"))
+            print(f"{'='*60}\n")
+
+    def _update_progress_skeleton(self):
+        """progress.md의 자동 섹션(타임스탬프, step 목록)을 갱신. LLM 섹션은 보존."""
+        progress_path = self._phase_dir / "progress.md"
+        index = self._read_json(self._index_file)
+        steps = index["steps"]
+
+        completed = [s for s in steps if s["status"] == "completed"]
+        pending = next((s for s in steps if s["status"] == "pending"), None)
+        done_count = len(completed)
+        total = len(steps)
+
+        # LLM이 작성한 섹션 보존
+        llm_todo = "(LLM이 각 step 종료 시 작성)"
+        llm_notes = "(LLM이 각 step 종료 시 작성)"
+        if progress_path.exists():
+            content = progress_path.read_text(encoding="utf-8")
+            todo_marker = "\n## 다음 할 일\n"
+            notes_marker = "\n## 주의사항\n"
+            if todo_marker in content:
+                after_todo = content[content.index(todo_marker) + len(todo_marker):]
+                if notes_marker in after_todo:
+                    llm_todo = after_todo[:after_todo.index(notes_marker)].strip()
+                    llm_notes = after_todo[after_todo.index(notes_marker) + len(notes_marker):].strip()
+                else:
+                    llm_todo = after_todo.strip()
+
+        completed_lines = "\n".join(
+            f"- Step {s['step']}: {s['name']} — {s.get('summary', '완료')}"
+            for s in completed
+        ) or "- 없음"
+        current = (
+            f"- Step {pending['step']}: {pending['name']}" if pending else "- 모든 step 완료"
+        )
+
+        new_content = (
+            f"# {self._phase_name} 진행 현황\n\n"
+            f"## 마지막 업데이트\n"
+            f"{self._stamp()} — Step {done_count}/{total} 완료\n\n"
+            f"## 완료된 작업\n{completed_lines}\n\n"
+            f"## 현재 진행 중\n{current}\n\n"
+            f"## 다음 할 일\n{llm_todo}\n\n"
+            f"## 주의사항\n{llm_notes}\n"
+        )
+        progress_path.write_text(new_content, encoding="utf-8")
+
+    def _check_completion_gate(self):
+        """feature_list.json의 모든 feature가 passes: true인지 확인. 미통과 시 중단."""
+        feature_list_path = self._phase_dir / "feature_list.json"
+        if not feature_list_path.exists():
+            return
+        data = self._read_json(feature_list_path)
+        remaining = [f for f in data.get("features", []) if not f.get("passes", False)]
+        if remaining:
+            print(f"\n{'='*60}")
+            print(f"  ⚠️  완료 선언 불가: {len(remaining)}개 feature 미통과")
+            for f in remaining:
+                print(f"  - [{f['id']}] {f['name']}")
+            print(f"{'='*60}")
+            sys.exit(1)
+
     def _finalize(self):
+        self._check_completion_gate()
         index = self._read_json(self._index_file)
         index["completed_at"] = self._stamp()
         self._write_json(self._index_file, index)
