@@ -148,9 +148,15 @@ MCP 서버를 연결하면 매 메시지마다 해당 서버의 도구 정의가
 6. **주의사항은 구체적으로** — "X를 하지 마라. 이유: Y" 형식으로 적는다.
 7. **네이밍** — kebab-case slug (예: `project-setup`, `api-layer`)
 
-**D. 파일 생성** — 승인 후 `phases/index.json`, `phases/{task}/index.json`, `phases/{task}/step{N}.md` 생성
+**D. 파일 생성** — 승인 후 아래 파일들을 생성한다.
 
-**E. 실행**
+- `phases/index.json` — 전체 phase 현황
+- `phases/{task}/index.json` — task 상세 (step 목록, 초기 status: "pending")
+- `phases/{task}/step{N}.md` — 각 step 지시 파일
+- `phases/{task}/feature_list.json` — 조기 종료 방지 게이트 (이 task에서 구현할 모든 기능 나열, 모두 passes: false로 초기화)
+- `phases/{task}/progress.md` — 세션 간 인수인계 문서 (뼈대만, execute.py가 step 완료마다 자동 갱신)
+
+**E. 실행** — execute.py 실행 전, feature_list.json의 feature 목록이 완료 기준을 모두 포함하는지 사용자에게 확인한다.
 
 ```bash
 python3 scripts/execute.py {task-name}        # 순차 실행
