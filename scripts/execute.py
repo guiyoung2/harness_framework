@@ -21,6 +21,11 @@ from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Python 최소 버전 체크 (3.8+)
+if sys.version_info < (3, 8):
+    print(f"ERROR: Python 3.8 이상이 필요합니다. 현재: {sys.version}")
+    sys.exit(1)
+
 # Windows cp949 콘솔에서 한글/유니코드 출력 깨짐 방지
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -417,9 +422,18 @@ class StepExecutor:
                 sys.exit(2)
 
             err_msg = next(
-                (s.get("error_message", "Step did not update status") for s in index["steps"] if s["step"] == step_num),
-                "Step did not update status",
+                (s.get("error_message", "") for s in index["steps"] if s["step"] == step_num),
+                "",
             )
+            if not err_msg:
+                # LLM이 status를 업데이트하지 않은 경우 output.json에서 원인 추출
+                try:
+                    out_data = self._read_json(self._phase_dir / f"step{step_num}-output.json")
+                    stdout_data = json.loads(out_data.get("stdout", "{}"))
+                    result = stdout_data.get("result", "")
+                    err_msg = f"LLM이 status를 업데이트하지 않음. result: {result[:200]}" if result else "Step did not update status"
+                except Exception:
+                    err_msg = "Step did not update status"
 
             if attempt < self.MAX_RETRIES:
                 for s in index["steps"]:
