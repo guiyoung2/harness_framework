@@ -21,6 +21,10 @@ from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Windows cp949 콘솔에서 한글/유니코드 출력 깨짐 방지
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 
 def load_config(root: Path) -> dict:
     config_file = root / "harness.config.json"
@@ -223,11 +227,11 @@ class StepExecutor:
         sections = []
         agents_md = ROOT / "AGENTS.md"
         if agents_md.exists():
-            sections.append(f"## 프로젝트 규칙 (AGENTS.md)\n\n{agents_md.read_text()}")
+            sections.append(f"## 프로젝트 규칙 (AGENTS.md)\n\n{agents_md.read_text(encoding='utf-8')}")
         docs_dir = ROOT / "docs"
         if docs_dir.is_dir():
             for doc in sorted(docs_dir.glob("*.md")):
-                sections.append(f"## {doc.stem}\n\n{doc.read_text()}")
+                sections.append(f"## {doc.stem}\n\n{doc.read_text(encoding='utf-8')}")
         return "\n\n---\n\n".join(sections) if sections else ""
 
     @staticmethod
@@ -276,6 +280,17 @@ class StepExecutor:
             f"   (두 파일이 없으면 스킵)\n\n---\n\n"
         )
 
+    @staticmethod
+    def _check_rate_limit(output: dict) -> tuple[bool, str]:
+        """output JSON에서 rate limit(429) 여부 감지. (is_rate_limit, message)"""
+        try:
+            data = json.loads(output.get("stdout", "{}"))
+            if data.get("api_error_status") == 429:
+                return True, data.get("result", "session limit reached")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return False, ""
+
     # --- 엔진 호출 ---
 
     def _invoke_engine(self, step: dict, preamble: str) -> dict:
@@ -286,7 +301,7 @@ class StepExecutor:
             print(f"  ERROR: {step_file} not found")
             sys.exit(1)
 
-        prompt = preamble + step_file.read_text()
+        prompt = preamble + step_file.read_text(encoding='utf-8')
         returncode, stdout, stderr = self._adapter.run(prompt, self._root)
 
         if returncode != 0:
@@ -300,7 +315,7 @@ class StepExecutor:
             "stdout": stdout, "stderr": stderr,
         }
         out_path = self._phase_dir / f"step{step_num}-output.json"
-        with open(out_path, "w") as f:
+        with open(out_path, "w", encoding='utf-8') as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
         return output
@@ -356,8 +371,25 @@ class StepExecutor:
                 tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
 
             with progress_indicator(tag) as pi:
-                self._invoke_engine(step, preamble)
+                output = self._invoke_engine(step, preamble)
                 elapsed = int(pi.elapsed)
+
+            # Rate limit 감지: LLM이 실행 자체가 안 된 경우 즉시 blocked 처리
+            is_rate_limit, rate_msg = self._check_rate_limit(output)
+            if is_rate_limit:
+                ts = self._stamp()
+                index = self._read_json(self._index_file)
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["status"] = "blocked"
+                        s["blocked_reason"] = f"rate-limit (429): {rate_msg}"
+                        s["blocked_at"] = ts
+                self._write_json(self._index_file, index)
+                self._update_top_index("blocked")
+                print(f"\n  ⏸ Step {step_num}: rate limited [{elapsed}s]")
+                print(f"    {rate_msg}")
+                print(f"    세션 한도 리셋 후 status를 'pending'으로 바꾸고 재실행하세요.")
+                sys.exit(2)
 
             index = self._read_json(self._index_file)
             status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
