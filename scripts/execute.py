@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -50,16 +51,17 @@ class ClaudeAdapter:
 
 
 class CodexAdapter:
-    """codex CLI로 step을 실행하는 어댑터.
-
-    NOTE: Codex CLI 비대화형 플래그는 설치 후 `codex --help`로 확인하여 수정할 것.
-    현재 `-q` 플래그를 사용하나 버전에 따라 다를 수 있다.
-    """
+    """codex CLI로 step을 실행하는 어댑터."""
 
     def run(self, prompt: str, cwd: str, timeout: int = 1800) -> tuple[int, str, str]:
+        # Windows에서 npm shim(.cmd) 우선 탐색
+        if sys.platform == "win32":
+            codex_bin = shutil.which("codex.cmd") or shutil.which("codex") or "codex"
+        else:
+            codex_bin = shutil.which("codex") or "codex"
         result = subprocess.run(
-            ["codex", "-q", prompt],
-            cwd=cwd, capture_output=True, text=True, timeout=timeout,
+            [codex_bin, "exec", "--dangerously-bypass-approvals-and-sandbox", "-"],
+            input=prompt, cwd=cwd, capture_output=True, text=True, encoding="utf-8", timeout=timeout,
         )
         return result.returncode, result.stdout, result.stderr
 
@@ -73,7 +75,7 @@ def create_adapter(engine: str) -> ClaudeAdapter | CodexAdapter:
 @contextlib.contextmanager
 def progress_indicator(label: str):
     """터미널 진행 표시기. with 문으로 사용하며 .elapsed 로 경과 시간을 읽는다."""
-    frames = "◐◓◑◒"
+    frames = "|/-\\"
     stop = threading.Event()
     t0 = time.monotonic()
 
@@ -265,6 +267,11 @@ class StepExecutor:
             f"당신은 {self._project} 프로젝트의 개발자입니다. 아래 step을 수행하세요.\n\n"
             f"{guardrails}\n\n---\n\n"
             f"{step_context}{retry_section}"
+            f"## 절대 수정 금지 파일\n\n"
+            f"아래 파일은 어떤 이유로도 수정하지 마라:\n"
+            f"- `scripts/` 디렉토리 내 모든 파일 (execute.py 포함)\n"
+            f"- `harness.config.json`\n\n"
+            f"---\n\n"
             f"## 작업 규칙\n\n"
             f"1. 이전 step에서 작성된 코드를 확인하고 일관성을 유지하라.\n"
             f"2. 이 step에 명시된 작업만 수행하라. 추가 기능이나 파일을 만들지 마라.\n"
