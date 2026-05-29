@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -44,7 +45,7 @@ class ClaudeAdapter:
     def run(self, prompt: str, cwd: str, timeout: int = 1800) -> tuple[int, str, str]:
         result = subprocess.run(
             ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
-            cwd=cwd, capture_output=True, text=True, timeout=timeout,
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", timeout=timeout,
         )
         return result.returncode, result.stdout, result.stderr
 
@@ -52,14 +53,18 @@ class ClaudeAdapter:
 class CodexAdapter:
     """codex CLI로 step을 실행하는 어댑터.
 
-    NOTE: Codex CLI 비대화형 플래그는 설치 후 `codex --help`로 확인하여 수정할 것.
-    현재 `-q` 플래그를 사용하나 버전에 따라 다를 수 있다.
+    NOTE: Codex CLI 비대화형 실행은 현재 `codex exec`를 사용한다.
     """
 
     def run(self, prompt: str, cwd: str, timeout: int = 1800) -> tuple[int, str, str]:
+        # Windows에서 npm shim(.cmd) 우선 탐색
+        if sys.platform == "win32":
+            codex_bin = shutil.which("codex.cmd") or shutil.which("codex") or "codex"
+        else:
+            codex_bin = shutil.which("codex") or "codex"
         result = subprocess.run(
-            ["codex", "-q", prompt],
-            cwd=cwd, capture_output=True, text=True, timeout=timeout,
+            [codex_bin, "exec", "--dangerously-bypass-approvals-and-sandbox", "-"],
+            input=prompt, cwd=cwd, capture_output=True, text=True, encoding="utf-8", timeout=timeout,
         )
         return result.returncode, result.stdout, result.stderr
 
@@ -73,7 +78,7 @@ def create_adapter(engine: str) -> ClaudeAdapter | CodexAdapter:
 @contextlib.contextmanager
 def progress_indicator(label: str):
     """터미널 진행 표시기. with 문으로 사용하며 .elapsed 로 경과 시간을 읽는다."""
-    frames = "◐◓◑◒"
+    frames = "|/-\\"
     stop = threading.Event()
     t0 = time.monotonic()
 
@@ -162,7 +167,7 @@ class StepExecutor:
 
     def _run_git(self, *args) -> subprocess.CompletedProcess:
         cmd = ["git"] + list(args)
-        return subprocess.run(cmd, cwd=self._root, capture_output=True, text=True)
+        return subprocess.run(cmd, cwd=self._root, capture_output=True, text=True, encoding="utf-8")
 
     def _checkout_branch(self):
         branch = f"feat-{self._phase_name}"
@@ -265,6 +270,11 @@ class StepExecutor:
             f"당신은 {self._project} 프로젝트의 개발자입니다. 아래 step을 수행하세요.\n\n"
             f"{guardrails}\n\n---\n\n"
             f"{step_context}{retry_section}"
+            f"## 절대 수정 금지 파일\n\n"
+            f"아래 파일은 어떤 이유로도 수정하지 마라:\n"
+            f"- `scripts/` 디렉토리 내 모든 파일 (execute.py 포함)\n"
+            f"- `harness.config.json`\n\n"
+            f"---\n\n"
             f"## 작업 규칙\n\n"
             f"1. 이전 step에서 작성된 코드를 확인하고 일관성을 유지하라.\n"
             f"2. 이 step에 명시된 작업만 수행하라. 추가 기능이나 파일을 만들지 마라.\n"
@@ -320,7 +330,7 @@ class StepExecutor:
             "stdout": stdout, "stderr": stderr,
         }
         out_path = self._phase_dir / f"step{step_num}-output.json"
-        with open(out_path, "w", encoding='utf-8') as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
         return output
@@ -379,6 +389,25 @@ class StepExecutor:
                 output = self._invoke_engine(step, preamble)
                 elapsed = int(pi.elapsed)
 
+            # 비정상 종료 시 재시도 없이 즉시 error 처리 (토큰 소모, 프로세스 크래시 등)
+            if output["exitCode"] != 0:
+                index = self._read_json(self._index_file)
+                cur_status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
+                if cur_status == "pending":
+                    ts = self._stamp()
+                    for s in index["steps"]:
+                        if s["step"] == step_num:
+                            s["status"] = "error"
+                            s["error_message"] = f"엔진 비정상 종료 (code {output['exitCode']})"
+                            s["failed_at"] = ts
+                    self._write_json(self._index_file, index)
+                    self._update_progress_skeleton()
+                    self._commit_step(step_num, step_name)
+                    self._update_top_index("error")
+                    print(f"  ✗ Step {step_num}: {step_name} 비정상 종료 (code {output['exitCode']}) [{elapsed}s]")
+                    print(f"    토큰 소모 또는 오류로 중단됨. status를 'pending'으로 리셋 후 재실행하세요.")
+                    sys.exit(1)
+
             # Rate limit 감지: LLM이 실행 자체가 안 된 경우 즉시 blocked 처리
             is_rate_limit, rate_msg = self._check_rate_limit(output)
             if is_rate_limit:
@@ -426,12 +455,14 @@ class StepExecutor:
                 "",
             )
             if not err_msg:
-                # LLM이 status를 업데이트하지 않은 경우 output.json에서 원인 추출
                 try:
                     out_data = self._read_json(self._phase_dir / f"step{step_num}-output.json")
                     stdout_data = json.loads(out_data.get("stdout", "{}"))
                     result = stdout_data.get("result", "")
-                    err_msg = f"LLM이 status를 업데이트하지 않음. result: {result[:200]}" if result else "Step did not update status"
+                    err_msg = (
+                        f"LLM이 status를 업데이트하지 않음. result: {result[:200]}"
+                        if result else "Step did not update status"
+                    )
                 except Exception:
                     err_msg = "Step did not update status"
 
